@@ -2,6 +2,7 @@ from openai import OpenAI
 import json, os
 import requests
 import uuid
+import base64
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder, PromptTemplate
@@ -37,30 +38,48 @@ class DiseaseRAG:
     def __init__(self, api_key: str):
         self.embeddings = OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=api_key)
         self.vectorstore = None
-        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7, openai_api_key=api_key)
+        self.llm = ChatOpenAI(model="gpt-4o-mini-2024-07-18", temperature=0.7, openai_api_key=api_key)
 
     def rag_document(self, file_path: str, query: str, k: int = 3):
-
-        with open(file_path, 'r', encoding="utf-8") as f:
-            data = json.load(f)
-
+        
         chunks = []
-            # JSON은 Key(병명) 단위로 끊어서 저장
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        for disease_name, details in data.items():
-            if isinstance(details, (dict, list)):
-                detail_str = json.dumps(details, ensure_ascii=False, indent=2)
-            else:
-                detail_str = str(details)
-            full_text = f"질병명: {disease_name}\n\n상세설명:\n{detail_str}"
-            if len(full_text) > 1000:
-                chunks.extend(text_splitter.split_text(full_text))
-            else:
-                chunks.append(full_text)
+        
+        # 파일 확장자 확인 (.json 또는 .txt)
+        ext = os.path.splitext(file_path)[1].lower()
 
-        self.vectorstore = FAISS.from_texts(texts=chunks, embedding=self.embeddings)
-        docs = self.vectorstore.similarity_search(query, k=k)
-        retrieved_text = "\n\n".join([doc.page_content for doc in docs])
+        # 1. JSON 파일일 경우 (기존 로직 유지)
+        if ext == '.json':
+            with open(file_path, 'r', encoding="utf-8") as f:
+                data = json.load(f)
+
+            for disease_name, details in data.items():
+                if isinstance(details, (dict, list)):
+                    detail_str = json.dumps(details, ensure_ascii=False, indent=2)
+                else:
+                    detail_str = str(details)
+                full_text = f"질병명: {disease_name}\n\n상세설명:\n{detail_str}"
+                
+                if len(full_text) > 1000:
+                    chunks.extend(text_splitter.split_text(full_text))
+                else:
+                    chunks.append(full_text)
+
+        # 2. TXT 파일일 경우 (새로 추가된 로직)
+        elif ext == '.txt':
+            with open(file_path, 'r', encoding="utf-8") as f:
+                full_text = f.read()
+            
+            # 텍스트 전체를 스플리터로 나누어 chunks에 추가
+            chunks.extend(text_splitter.split_text(full_text))
+
+        # 벡터 스토어 생성 및 검색 (공통 로직)
+        if chunks:
+            self.vectorstore = FAISS.from_texts(texts=chunks, embedding=self.embeddings)
+            docs = self.vectorstore.similarity_search(query, k=k)
+            retrieved_text = "\n\n".join([doc.page_content for doc in docs])
+        else:
+            retrieved_text = ""
 
         prompt_template = """다음은 '{query}'에 대한 의료 문서에서 검색한 내용입니다.
 이 내용을 보호자가 이해하기 쉬운 한국어 설명으로 바꿔 주세요.
@@ -115,7 +134,7 @@ class MedicalAgent:
         """asr"""
         with open(audio_path, "rb") as audio_file:
             transcript = self.client.audio.transcriptions.create(
-                model="gpt-4o-transcribe",
+                model="gpt-4o-mini-transcribe",
                 file=audio_file,
                 response_format="text"
             )
@@ -171,6 +190,44 @@ class MedicalAgent:
         )
         return {"analysis": response.choices[0].message.content}
 
+    def _func_analyze_symptoms(self, audio_path: str) -> dict:
+        """오디오 파일을 입력받아 질병별 음성 특징을 분석"""
+        with open(audio_path, "rb") as audio_file:
+            encoded_string = base64.b64encode(audio_file.read()).decode('utf-8')
+
+        system_guide = """
+        당신은 의료 음성 분석 전문가입니다. 제공된 오디오를 듣고 아래 질병들의 특징적인 '음성적/언어적 증상'이 나타나는지 정밀하게 분석하세요. 오디오는 두 사람 이상의 발화를 포함하고 있고, 정상적인 음성이라고 판단되는 사람이 아닌 사람의 음성을 위주로 분석해야 합니다.
+
+        ### 뇌질환별 음성 특징:
+        1. 루게릭병: 목소리 갈라짐, 심한 떨림, 힘 없음, 연구개음/유음 발음 뭉개짐, 사레 들리는 소리.
+        2. 파킨슨병: 거친 음성, 기식음(바람 새는 소리), 성대 떨림, 목소리 크기 감소, 단조로운 억양(Monotone).
+        3. 치매: 잦은 간투사(음, 어...), 동문서답, 맥락에 맞지 않는 감정 변화.
+        4. 뇌졸중: 불규칙한 말 속도, 발음 부정확, 쥐어짜는 듯한 소리, 실어증 증세.
+
+        위 특징 중 감지되는 것이 있다면 구체적으로 명시하고, 의심되는 질병을 제시하세요. 없으면 "정상"으로 답하세요.
+        """
+
+        response = self.client.chat.completions.create(
+                model="gpt-4o-audio-preview", 
+                messages=[
+                    {"role": "system", "content": system_guide},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "이 환자의 음성을 분석하여 질병 징후를 리포트해줘."},
+                            {
+                                "type": "input_audio", 
+                                "input_audio": {
+                                    "data": encoded_string,
+                                    "format": "wav" 
+                                }
+                            }
+                        ]
+                    }
+                ]
+            )
+        return {"symptom_analysis": response.choices[0].message.content}
+
     def _create_agent_executor(self):
         # StructuredTool: 툴 등록
         tools = [
@@ -193,6 +250,11 @@ class MedicalAgent:
                 func=self._func_analyze_report, 
                 name="analyze_previous_report_tool", 
                 description="이전 기록을 분석하여 환자의 상태 변화와 병력을 파악한다"
+            ),
+            StructuredTool.from_function(
+                func=self._func_analyze_symptoms, 
+                name="analyze_voice_symptoms_tool", 
+                description="오디오 파일 경로를 입력받고 질병별 음성 특징을 분석한다."
             )
         ]
 
@@ -204,6 +266,7 @@ AI 의료 보조 에이전트이다.
 ### 사용 가능한 tool:
 - analyze_previous_report_tool: 가장 먼저 사용하여 이전 환자 상태를 파악
 - diarized_transcription_tool(audio_path): ASR
+- analyze_voice_symptoms_tool(audio_path): 음성 파일을 통해 질환별 특징 유무 분석 
 - classify_neuro_status_tool(audio_path): 음성을 기준으로 뇌질환을 판별
 - rag_document(file_path, query): 특정 질병에 대한 의학 문서 컨텍스트를 RAG 방식으로 가져옴
 
@@ -216,18 +279,22 @@ result = {{
   "ASR": "통화 전사 데이터",
   "risk": ["뇌졸중 위험도", "치매 위험도", "파킨슨병 위험도", "루게릭병 위험도"],
   "explain": ["뇌졸중 설명", "치매 설명", "파킨슨병 설명", "루게릭병 설명"],
-  "summary": "종합 소견 (과거~현재 요약)"
+  "total": "종합 소견 3문장(75자 내외)",
+  "summary": "과거~현재 200자 요약"
 }}
 
-### 제약 조건:
+### 작동 및 출력 방식:
 - analyze_previous_report_tool 결과를 통해 과거를 확인한다.
 - "accuracy"는 classify_neuro_status_tool 툴의 결과를 그대로 사용한다.
 - "ASR"에는 diarized_transcription_tool을 사용해 얻은 전체 결과를 절대 요약하거나 내용을 변경하지 않은 채로 넣는다.
+- analyze_voice_symptoms_tool에 오디오 경로를 넣어 음성적 특징을 분석한다.
 - "risk" 리스트는 반드시 길이 4이며, 순서는 [뇌졸중, 치매, 파킨슨병, 루게릭병] 이다.
-- 각 위험도 값은 "정상", "관찰", "주의", "위험" 중 하나여야 한다. 이때 판단은 accuracy, ASR, 자가문단표, 과거 데이터와  비교를 기준으로 판단해야 한다.
+- 각 위험도 값은 "정상", "관찰", "주의", "위험" 중 하나여야 한다. 이때 판단은 accuracy, ASR, 자가문단표, analyze_voice_symptoms_tool 결과, 과거 데이터와의 비교를 기준으로 판단해야 한다.
 - "explain" 리스트는 길이 4이며, 순서 역시 [뇌졸중, 치매, 파킨슨병, 루게릭병] 이다.
-- 각 설명은 보호자가 이해하기 쉬운 한국어로 작성한다.
-- 만약 해당 질병 위험도가 "정상"인 경우에는 설명은 작성하지 않는다.
+- 각 설명은 보호자가 이해하기 쉬운 한국어로 작성한다. 이때, 자가문단표의 내용은 두 문장 이상을 차지해서는 안 된다. 또한 각 설명은 100자 안팎의 길이어야 한다. 즉, 25자 정도의 4문장을 설명으로 출력한다.
+- 각 설명의 시작에는 반드시 한 문장으로 자가문단표 분석 결과를 첫 문장으로 출력한다. 양식은 다음과 같다: "문단표 중 치매에 해당하는 체크리스트 00개 중 00개가 n점 이상이므로 경증/중증/위증에 해당합니다." 이때, n점을 출력할 때는 문단표 점수에서 +1을 더한 점수로 출력한다. 예를 들어, 문단표에 3점으로 되어 있다면 출력할 때는 4점이 된다. 정상은 +1을 더하였을 때 2점 이하, 경증은 +1을 더했을 때 3점, 중증은 +1을 더했을 때 4점, 위증은 +1을 더했을 때 5점 이상일 경우를 말한다.
+- 만약 해당 질병 위험도가 "정상"인 경우에는 별도의 설명은 작성하지 않고, ""로 리스트에 텍스트가 null값이 들어가도록 해야만 한다. 반면, "관찰", "주의", "위험"의 위험도는 반드시 설명을 작성해야 한다. 예를 들어, 치매 위험도가 "주의", 뇌졸중, 파킨슨, 루게릭이 모두 "정상"인 경우, 리스트는 ["", "치매 설명", "", ""]로 출력되어야 한다. 즉, explain에 해당하는 list의 길이가 risk와 동일하게 4가 되어야 한다. 또한 설명 출력 순서는 ["뇌졸중 설명", "치매 설명", "파킨슨병 설명", "루게릭병 설명"]이다. 위 출력 방식은 모두 반드시 지켜져야만 한다.
+- 종합 소견은 accuracy, ASR, risk, explain, 자가문단표 내용을 복합적으로 포함하여 75자 내외로 작성한다. 
 - 최종 응답은 반드시 위 result 딕셔너리 형태와 동일한 구조의 JSON 객체로만 출력한다. 그 외의 텍스트(설명, 사족)는 출력하지 않는다.
 - 마지막으로 과거부터 현재까지의 상태 및 진단 결과를 비교하고, 전체적인 추세를 중심으로 요약한다. 반드시 explain 밖의 별도의 키 "summary"로 작성해야만 한다. 초진일 경우, 현재의 결과만 출력해라.
 
@@ -236,9 +303,9 @@ result = {{
 2) 문단표 정보를 통해 현 상태에 대한 정보를 받는다. 문단표의 점수는 0~4 사이로, 0은 전혀 그렇지 않다, 4는 매우 그렇다를 나타낸다.
 3) 그 다음 classify_neuro_status_tool으로 세 가지 범주 확률을 얻는다.
 4) diarized_transcription_tool로 보호자와 피보호자의 대화 정보를 얻는다.
-5) 문단표 정보, 2번의 세 가지 범주 확률, 보호자와 피호자의 대화 내용, 과거 상태에서 변화 유무를 기준으로 뇌졸중, 치매, 파킨슨병, 루게릭병에 대한 위험도를 정상, 관찰, 주의, 위험으로 각각 판단한다.
-6) 관찰 이상 단계의 병에 대한 정보를 rag_document을 사용해서 각 질병에 대한 설명을 보완하여 보호자에게 전달할 설명을 구성한다. 이때, 자가문단표의 내용을 그대로 출력하기 보다 보호자가 인지하고 있어야 할 내용이나 보호자가 수행해야 할 내용을 중심으로 출력한다. 출력 시, 마침표와 쉼표만 특수문자로 사용한다. 문장 종결 시, 마침표를 사용하며, 쉼표는 문장 내에서만 사용한다.
-7) 마지막으로 과거부터 현재까지의 상태 및 진단 결과를 비교하고, 전체적인 추세를 중심으로 요약한다.
+5) 문단표 정보, 2)의 세 가지 범주 확률, 보호자와 피호자의 대화 내용, 과거 상태에서 변화 유무를 기준으로 뇌졸중, 치매, 파킨슨병, 루게릭병에 대한 위험도를 정상, 관찰, 주의, 위험으로 각각 판단한다.
+6) "관찰", "주의", "위험" 단계에 해당하는 병에 대한 정보를 rag_document을 사용해서 각 질병에 대한 설명을 보완하여 보호자에게 전달할 설명을 구성한다. 이때, 자가문단표의 내용을 그대로 출력하기 보다 보호자가 인지하고 있어야 할 내용이나 보호자가 수행해야 할 내용을 중심으로 출력한다. 출력 시, 마침표와 쉼표만 특수문자로 사용한다. 문장 종결 시, 마침표를 사용하며, 쉼표는 문장 내에서만 사용한다.
+7) 마지막으로 과거부터 현재까지의 상태 및 진단 결과를 비교하고, 전체적인 추세를 중심으로 요약 및 종합 소견을 작성한다.
 """
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_prompt),
@@ -252,49 +319,38 @@ result = {{
         return AgentExecutor(agent=agent, tools=tools, verbose=True)
 
     def run(self, audio_path: str, self_report: dict, previous_report: dict = None) -> dict:
-            """외부 호출 함수 (URL 다운로드 + Fail Fast 적용)"""
+        """외부 호출 함수 (URL 다운로드 + Fail Fast)"""
+        target_path = audio_path 
+
+        if str(audio_path).startswith("http"):
+            print(f"📥 URL 감지됨. 다운로드 시작: {audio_path}")
+            headers = {"User-Agent": "Mozilla/5.0"}
+            response = requests.get(audio_path, headers=headers)
+            response.raise_for_status()
+
+            unique_filename = f"downloaded_{uuid.uuid4()}.wav"
+            target_path = os.path.join("/content", unique_filename)
+            with open(target_path, "wb") as f:
+                f.write(response.content)
+            print(f"✅ 다운로드 완료: {target_path}")
+
+        if not os.path.exists(target_path):
+             raise FileNotFoundError(f"Audio file not found: {target_path}")
+
+        report_str = json.dumps(previous_report, ensure_ascii=False) if previous_report else "null"
+
+        user_input = {
+            "audio_path": target_path,
+            "self_report_json": json.dumps(self_report, ensure_ascii=False),
+            "previous_report": report_str
+        }
+
+        output = self.agent_executor.invoke(user_input)
+        raw = output.get("output", output)
+
+        print(raw)
             
-            target_path = audio_path 
-
-            # 1. URL(http)인 경우 다운로드 실행
-            # (try-except 없이, 다운로드 실패하면 즉시 에러 발생하고 멈춤)
-            if str(audio_path).startswith("http"):
-                print(f"📥 URL 감지됨. 다운로드 시작: {audio_path}")
-                
-                # 브라우저 헤더 추가 (403 방지)
-                headers = {"User-Agent": "Mozilla/5.0"}
-                
-                response = requests.get(audio_path, headers=headers)
-                response.raise_for_status() # 200 OK 아니면 여기서 바로 에러 발생
-
-                # 고유 파일명으로 저장
-                unique_filename = f"downloaded_{uuid.uuid4()}.wav"
-                target_path = os.path.join("/content", unique_filename)
-                
-                with open(target_path, "wb") as f:
-                    f.write(response.content)
-                print(f"✅ 다운로드 완료: {target_path}")
-
-            # 2. 파일 존재 확인 (없으면 FileNotFoundError 발생)
-            if not os.path.exists(target_path):
-                raise FileNotFoundError(f"Audio file not found: {target_path}")
-
-            # 3. 데이터 준비
-            report_str = json.dumps(previous_report, ensure_ascii=False) if previous_report else "null"
-
-            user_input = {
-                "audio_path": target_path,  # 로컬 경로(또는 다운로드된 경로) 전달
-                "self_report_json": json.dumps(self_report, ensure_ascii=False),
-                "previous_report": report_str
-            }
-
-            # 4. 에이전트 실행
-            output = self.agent_executor.invoke(user_input)
-            raw = output.get("output", output)
-                
-            # 5. 결과 파싱 (문자열이면 JSON 변환, 실패하면 에러 발생)
-            if isinstance(raw, str):
-                clean_raw = raw.replace("```json", "").replace("```", "").strip()
-                return json.loads(clean_raw)
-                
-            return raw
+        if isinstance(raw, str):
+            clean_raw = raw.replace("```json", "").replace("```", "").strip()
+            return json.loads(clean_raw)
+        return raw
