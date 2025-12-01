@@ -22,7 +22,7 @@ AI_Server/
 ├── dataset/
 │   ├── audio_cls_dataset.csv		# 뇌질환 음성
 │   ├── normal_audio_dataset.csv	# 일반 노인 음성
-│   └── rag_practicce.txt			# rag 실험용 음성
+│   └── rag_practicce.txt			# rag 실험용 문서
 ├── dummy/					# 테스트용 더미데이터
 │   ├── dummydata1.json		
 │   ├── dummydata2.json
